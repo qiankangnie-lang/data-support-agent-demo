@@ -4,6 +4,7 @@ import os
 import json
 import re
 import html
+import csv
 from pathlib import Path
 from typing import Any
 from datetime import datetime
@@ -19,6 +20,7 @@ load_dotenv()
 APP_TITLE = "数据支持智能分诊与问数助手"
 PROMPT_DIR = Path("prompts")
 LOG_DIR = Path("conversation_logs")
+SUBMITTED_TICKETS_PATH = Path("submitted_tickets.csv")
 REQUIRED_SHEET = "问题记录数据"
 API_KEY_MISSING_MESSAGE = "当前未配置 OpenAI API Key，无法调用运行时大模型。请在 .env 文件中配置 OPENAI_API_KEY。"
 
@@ -44,6 +46,13 @@ SUPPORT_PROMPTS = {
     "使用咨询类": "consultation_prompt.txt",
 }
 
+TICKET_TYPES = {
+    "权限申请类",
+    "新增数据需求类",
+    "数据异常类",
+    "口径确认类",
+}
+
 ANALYSIS_INTENTS = {
     "issue_type_count",
     "department_count",
@@ -52,6 +61,34 @@ ANALYSIS_INTENTS = {
     "avg_missing_fields_by_type",
     "unsupported",
 }
+
+ANALYSIS_TYPES = {
+    "total_count",
+    "filtered_count",
+    "group_count",
+    "top_n",
+    "average_metric",
+    "percentage",
+    "cross_analysis",
+    "trend",
+    "unsupported",
+}
+
+STANDARD_ANALYSIS_COLUMNS = [
+    "issue_id",
+    "submit_date",
+    "department",
+    "issue_type",
+    "object_name",
+    "status",
+    "priority",
+    "handler_role",
+    "missing_fields_count",
+    "resolve_hours",
+    "is_sensitive",
+    "satisfaction",
+    "source",
+]
 
 COLUMN_MAPPING = {
     "问题编号": "issue_id",
@@ -85,6 +122,23 @@ BUILT_IN_TESTS = [
     ("复购率这个指标到底怎么算？运营和数据团队说法不一样。", "口径确认类"),
     ("DAU 是什么意思？", "使用咨询类"),
     ("哪类问题最多？", "数据分析问数类"),
+]
+
+ANALYSIS_PLAN_TESTS = [
+    ("一共有多少条工单？", "total_count", {}),
+    ("权限申请类问题有多少？", "filtered_count", {"issue_type": "权限申请类"}),
+    ("数据异常类问题有多少？", "filtered_count", {"issue_type": "数据异常类"}),
+    ("运营部提交了多少问题？", "filtered_count", {"department": "运营部"}),
+    ("涉及敏感数据的问题有多少？", "filtered_count", {"is_sensitive": "是"}),
+    ("各类问题分别有多少？", "group_count", {"group_by": "issue_type"}),
+    ("各部门分别提交了多少问题？", "group_count", {"group_by": "department"}),
+    ("哪类问题最多？", ("top_n", "group_count"), {"group_by": "issue_type"}),
+    ("哪个部门提交最多？", ("top_n", "group_count"), {"group_by": "department"}),
+    ("哪类问题平均解决时长最长？", "average_metric", {"group_by": "issue_type", "metric": "resolve_hours"}),
+    ("权限申请类占全部问题的比例是多少？", "percentage", {"issue_type": "权限申请类"}),
+    ("运营部提交的问题主要集中在哪类？", ("group_count", "cross_analysis"), {"department": "运营部", "group_by": "issue_type"}),
+    ("各部门分别最常提交哪类问题？", "cross_analysis", {"group_by": ["department", "issue_type"]}),
+    ("最近一周每天的问题数量趋势是什么？", "trend", {}),
 ]
 
 
@@ -153,7 +207,61 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
             normalized[column] = pd.to_numeric(normalized[column], errors="coerce")
     if "submit_date" in normalized.columns:
         normalized["submit_date"] = pd.to_datetime(normalized["submit_date"], errors="coerce")
+    if "source" not in normalized.columns:
+        normalized["source"] = "上传Excel"
+    for column in STANDARD_ANALYSIS_COLUMNS:
+        if column not in normalized.columns:
+            normalized[column] = pd.NA
     return normalized
+
+
+def load_submitted_tickets_for_analysis() -> pd.DataFrame:
+    if not SUBMITTED_TICKETS_PATH.exists():
+        return pd.DataFrame()
+    try:
+        tickets = pd.read_csv(SUBMITTED_TICKETS_PATH)
+    except Exception:
+        return pd.DataFrame()
+    if tickets.empty:
+        return pd.DataFrame()
+
+    mapped = pd.DataFrame()
+    mapped["issue_id"] = tickets.get("ticket_id", "")
+    mapped["submit_date"] = tickets.get("created_at", "")
+    mapped["department"] = "已提交工单"
+    mapped["issue_type"] = tickets.get("ticket_type", "")
+    mapped["object_name"] = tickets.get("original_question", "")
+    mapped["status"] = tickets.get("status", "")
+    mapped["priority"] = ""
+    mapped["handler_role"] = tickets.get("handler_role", "")
+    mapped["missing_fields_count"] = tickets.get("missing_info", "").fillna("").apply(
+        lambda value: 0 if missing_info_is_empty(str(value)) else len(split_missing_items(str(value)))
+    )
+    mapped["resolve_hours"] = pd.NA
+    mapped["is_sensitive"] = tickets.get("original_question", "").fillna("").apply(
+        lambda value: "是" if re.search(r"手机号|身份证|银行卡|地址|收货地址|姓名", str(value)) else "否"
+    )
+    mapped["satisfaction"] = pd.NA
+    mapped["source"] = "已提交工单"
+    return normalize_columns(mapped)
+
+
+def build_analysis_dataframe(excel_df: pd.DataFrame | None) -> pd.DataFrame | None:
+    frames = []
+    if excel_df is not None and not excel_df.empty:
+        frames.append(normalize_columns(excel_df))
+
+    submitted_df = load_submitted_tickets_for_analysis()
+    if not submitted_df.empty:
+        frames.append(submitted_df)
+
+    if not frames:
+        return None
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    for column in STANDARD_ANALYSIS_COLUMNS:
+        if column not in combined.columns:
+            combined[column] = pd.NA
+    return combined[STANDARD_ANALYSIS_COLUMNS]
 
 
 def build_recent_context() -> str:
@@ -222,6 +330,185 @@ def ensure_columns(df: pd.DataFrame, columns: list[str]) -> None:
         raise ValueError(f"上传数据缺少必要字段：{', '.join(missing)}")
 
 
+def parse_analysis_plan(raw_plan: str) -> dict[str, Any]:
+    try:
+        plan = json.loads(raw_plan)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw_plan, flags=re.S)
+        if not match:
+            raise ValueError(f"分析计划解析失败，LLM 原始输出：{raw_plan}")
+        try:
+            plan = json.loads(match.group(0))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"分析计划解析失败，LLM 原始输出：{raw_plan}") from exc
+
+    filters = plan.get("filters") or {}
+    normalized_filters = {
+        "issue_type": filters.get("issue_type"),
+        "department": filters.get("department"),
+        "status": filters.get("status"),
+        "priority": filters.get("priority"),
+        "handler_role": filters.get("handler_role"),
+        "is_sensitive": filters.get("is_sensitive"),
+        "date_range": filters.get("date_range"),
+    }
+    return {
+        "analysis_type": plan.get("analysis_type", "unsupported"),
+        "filters": normalized_filters,
+        "group_by": plan.get("group_by"),
+        "metric": plan.get("metric") or "count",
+        "aggregation": plan.get("aggregation") or "count",
+        "sort": plan.get("sort") or "desc",
+        "top_n": int(plan.get("top_n") or 5),
+        "explanation": plan.get("explanation", ""),
+    }
+
+
+def get_source_summary(df: pd.DataFrame) -> dict[str, int]:
+    source_counts = df.get("source", pd.Series(dtype=str)).fillna("").value_counts().to_dict()
+    excel_count = int(source_counts.get("上传Excel", 0))
+    submitted_count = int(source_counts.get("已提交工单", 0))
+    return {
+        "excel_count": excel_count,
+        "submitted_count": submitted_count,
+        "total_count": int(len(df)),
+    }
+
+
+def apply_analysis_filters(df: pd.DataFrame, filters: dict[str, Any]) -> pd.DataFrame:
+    filtered = df.copy()
+    for column, value in (filters or {}).items():
+        if column == "date_range" or value in (None, "", []):
+            continue
+        if column not in filtered.columns:
+            raise ValueError(f"当前数据集不包含字段：{column}")
+        if isinstance(value, list):
+            filtered = filtered[filtered[column].astype(str).isin([str(item) for item in value])]
+        else:
+            filtered = filtered[filtered[column].astype(str) == str(value)]
+
+    date_range = (filters or {}).get("date_range")
+    if date_range and "submit_date" in filtered.columns:
+        dates = pd.to_datetime(filtered["submit_date"], errors="coerce")
+        if isinstance(date_range, dict):
+            start = pd.to_datetime(date_range.get("start"), errors="coerce")
+            end = pd.to_datetime(date_range.get("end"), errors="coerce")
+            if pd.notna(start):
+                filtered = filtered[dates >= start]
+            if pd.notna(end):
+                filtered = filtered[dates <= end]
+    return filtered
+
+
+def make_empty_result(message: str) -> dict[str, Any]:
+    return {
+        "analysis_name": "无匹配结果",
+        "result_table": pd.DataFrame([{"说明": message}]),
+        "result_dict": {"message": message},
+    }
+
+
+def sort_table(df: pd.DataFrame, by: str, direction: str) -> pd.DataFrame:
+    if by not in df.columns:
+        return df
+    return df.sort_values(by=by, ascending=(direction == "asc"))
+
+
+def execute_analysis_plan(plan: dict[str, Any], combined_df: pd.DataFrame) -> dict[str, Any]:
+    analysis_type = plan.get("analysis_type", "unsupported")
+    if analysis_type not in ANALYSIS_TYPES:
+        analysis_type = "unsupported"
+
+    if analysis_type == "unsupported":
+        return make_empty_result("当前问题超出基础问数能力。支持总量、筛选计数、分组计数、Top N、平均值、占比、交叉分析和趋势分析。")
+
+    filtered = apply_analysis_filters(combined_df, plan.get("filters", {}))
+    total_count = len(combined_df)
+    filtered_count = len(filtered)
+    if filtered.empty and analysis_type not in {"total_count"}:
+        return make_empty_result("没有匹配记录。")
+
+    group_by = plan.get("group_by")
+    metric = plan.get("metric") or "count"
+    sort_direction = plan.get("sort") or "desc"
+    top_n = int(plan.get("top_n") or 5)
+
+    if analysis_type == "total_count":
+        table = pd.DataFrame([{"指标": "总记录数", "数量": filtered_count if plan.get("filters") else total_count}])
+        return {"analysis_name": "总量统计", "result_table": table, "result_dict": table.to_dict(orient="records")}
+
+    if analysis_type == "filtered_count":
+        ratio = round(filtered_count / total_count * 100, 2) if total_count else 0
+        table = pd.DataFrame([{"指标": "匹配记录数", "数量": filtered_count, "占比": f"{ratio}%"}])
+        return {"analysis_name": "条件筛选计数", "result_table": table, "result_dict": table.to_dict(orient="records")}
+
+    if analysis_type == "group_count":
+        if not group_by:
+            group_by = "issue_type"
+        ensure_columns(filtered, [group_by] if isinstance(group_by, str) else group_by)
+        grouped = filtered.groupby(group_by, dropna=False).size().reset_index(name="数量")
+        grouped["占比"] = (grouped["数量"] / filtered_count * 100).round(2).astype(str) + "%"
+        grouped = sort_table(grouped, "数量", sort_direction)
+        return {"analysis_name": "分组计数", "result_table": grouped, "result_dict": grouped.to_dict(orient="records")}
+
+    if analysis_type == "top_n":
+        if not group_by:
+            group_by = "issue_type"
+        ensure_columns(filtered, [group_by] if isinstance(group_by, str) else group_by)
+        grouped = filtered.groupby(group_by, dropna=False).size().reset_index(name="数量")
+        grouped = sort_table(grouped, "数量", sort_direction).head(top_n)
+        return {"analysis_name": f"Top {top_n} 排序", "result_table": grouped, "result_dict": grouped.to_dict(orient="records")}
+
+    if analysis_type == "average_metric":
+        if metric == "count":
+            metric = "resolve_hours"
+        if not group_by:
+            group_by = "issue_type"
+        ensure_columns(filtered, [group_by, metric] if isinstance(group_by, str) else list(group_by) + [metric])
+        filtered = filtered.copy()
+        filtered[metric] = pd.to_numeric(filtered[metric], errors="coerce")
+        grouped = filtered.groupby(group_by, dropna=False)[metric].mean().round(2).reset_index(name="平均值")
+        grouped = grouped.dropna(subset=["平均值"])
+        if grouped.empty:
+            return make_empty_result(f"字段 {metric} 没有可计算的数值。")
+        grouped = sort_table(grouped, "平均值", sort_direction).head(top_n)
+        return {"analysis_name": "平均值分析", "result_table": grouped, "result_dict": grouped.to_dict(orient="records")}
+
+    if analysis_type == "percentage":
+        if group_by:
+            ensure_columns(filtered, [group_by] if isinstance(group_by, str) else group_by)
+            grouped = filtered.groupby(group_by, dropna=False).size().reset_index(name="数量")
+            grouped["占比"] = (grouped["数量"] / filtered_count * 100).round(2).astype(str) + "%"
+            grouped = sort_table(grouped, "数量", sort_direction)
+            return {"analysis_name": "分组占比分析", "result_table": grouped, "result_dict": grouped.to_dict(orient="records")}
+        ratio = round(filtered_count / total_count * 100, 2) if total_count else 0
+        table = pd.DataFrame([{"指标": "匹配记录占比", "数量": filtered_count, "总数": total_count, "占比": f"{ratio}%"}])
+        return {"analysis_name": "占比分析", "result_table": table, "result_dict": table.to_dict(orient="records")}
+
+    if analysis_type == "cross_analysis":
+        if not isinstance(group_by, list) or len(group_by) < 2:
+            group_by = ["department", "issue_type"]
+        ensure_columns(filtered, group_by)
+        grouped = filtered.groupby(group_by, dropna=False).size().reset_index(name="数量")
+        grouped = sort_table(grouped, "数量", sort_direction)
+        primary = group_by[0]
+        top_each = grouped.sort_values([primary, "数量"], ascending=[True, False]).groupby(primary, as_index=False).head(1)
+        return {"analysis_name": "交叉分析", "result_table": top_each, "result_dict": top_each.to_dict(orient="records")}
+
+    if analysis_type == "trend":
+        ensure_columns(filtered, ["submit_date"])
+        trend_df = filtered.copy()
+        trend_df["submit_date"] = pd.to_datetime(trend_df["submit_date"], errors="coerce")
+        trend_df = trend_df.dropna(subset=["submit_date"])
+        if trend_df.empty:
+            return make_empty_result("日期字段无法解析，暂不能生成趋势。")
+        trend_df["日期"] = trend_df["submit_date"].dt.date.astype(str)
+        grouped = trend_df.groupby("日期").size().reset_index(name="数量").sort_values("日期")
+        return {"analysis_name": "趋势分析", "result_table": grouped, "result_dict": grouped.to_dict(orient="records")}
+
+    return make_empty_result("当前分析类型暂不支持。")
+
+
 def run_pandas_analysis(intent: str, df: pd.DataFrame) -> dict[str, Any]:
     if intent == "issue_type_count":
         ensure_columns(df, ["issue_type"])
@@ -287,31 +574,51 @@ def run_pandas_analysis(intent: str, df: pd.DataFrame) -> dict[str, Any]:
     }
 
 
-def explain_analysis_with_llm(question: str, intent: str, stats: dict[str, Any]) -> str:
+def explain_analysis_with_llm(
+    question: str,
+    plan: dict[str, Any],
+    stats: dict[str, Any],
+    source_summary: dict[str, int],
+) -> str:
     system_prompt = load_prompt("data_analysis_prompt.txt")
     user_prompt = (
         f"最近 3 轮会话上下文：\n{build_recent_context()}\n\n"
-        "请基于以下 Pandas 真实统计结果，输出最终分析结果。\n"
+        "现在不是让你输出分析计划 JSON，而是基于以下 Pandas 真实统计结果，输出最终分析结果。\n"
         "必须使用以下格式：\n"
         "分析主题：\n统计结果：\n业务解释：\n优化建议：\n\n"
         f"用户问题：{question}\n"
-        f"分析意图：{intent}\n"
+        f"分析计划 JSON：{json.dumps(plan, ensure_ascii=False)}\n"
         f"Pandas 统计结果：{stats['result_dict']}\n"
-        f"最高项：{stats['top_item']}\n"
-        f"最高值：{stats['top_value']}"
+        "数据源说明："
+        f"上传 Excel 历史记录 {source_summary['excel_count']} 条，"
+        f"已提交工单记录 {source_summary['submitted_count']} 条，"
+        f"合并后总记录 {source_summary['total_count']} 条。"
     )
     return call_llm(system_prompt, user_prompt)
 
 
 def process_analysis_question(question: str, df: pd.DataFrame) -> dict[str, Any]:
-    intent, raw_intent, prompt_name = identify_analysis_intent(question)
-    stats = run_pandas_analysis(intent, df)
-    llm_explanation = explain_analysis_with_llm(question, intent, stats)
+    return analyze_question_with_llm_and_pandas(question, df)
+
+
+def analyze_question_with_llm_and_pandas(question: str, combined_df: pd.DataFrame) -> dict[str, Any]:
+    prompt_name = "data_analysis_prompt.txt"
+    system_prompt = load_prompt(prompt_name)
+    user_prompt = build_contextual_user_prompt(
+        question,
+        "请将当前问数问题解析为严格 JSON 分析计划。只输出 JSON，不要输出其他文字。",
+    )
+    raw_plan = call_llm(system_prompt, user_prompt)
+    plan = parse_analysis_plan(raw_plan)
+    stats = execute_analysis_plan(plan, combined_df)
+    source_summary = get_source_summary(combined_df)
+    llm_explanation = explain_analysis_with_llm(question, plan, stats, source_summary)
     return {
         "prompt_name": prompt_name,
-        "intent": intent,
-        "raw_intent": raw_intent,
+        "plan": plan,
+        "raw_plan": raw_plan,
         "stats": stats,
+        "source_summary": source_summary,
         "llm_explanation": llm_explanation,
     }
 
@@ -373,6 +680,7 @@ def reset_current_session() -> None:
     st.session_state.conversation = []
     st.session_state.execution_chain = {}
     st.session_state.result_text = ""
+    st.session_state.current_ticket = None
     st.session_state.last_saved_hint = "未保存"
     st.session_state.view = "home"
     st.session_state.current_session_file = None
@@ -493,6 +801,7 @@ def clear_current_session(delete_history_file: bool = False) -> None:
     st.session_state.conversation = []
     st.session_state.execution_chain = {}
     st.session_state.result_text = ""
+    st.session_state.current_ticket = None
     st.session_state.session_id = generate_session_id()
     st.session_state.session_title = "新会话"
     st.session_state.session_created_at = now
@@ -537,7 +846,6 @@ def render_sidebar_session_manager() -> None:
                 load_session_from_file(path)
                 st.rerun()
 
-
 def process_agent_turn(question: str, df: pd.DataFrame | None) -> tuple[str, dict[str, Any]]:
     question_type, raw_intent, intent_prompt = classify_with_llm(question)
     chain = {
@@ -556,21 +864,25 @@ def process_agent_turn(question: str, df: pd.DataFrame | None) -> tuple[str, dic
                 "llm_result": result,
             }
         )
+        if question_type in TICKET_TYPES:
+            st.session_state.current_ticket = create_ticket_from_support_response(question, question_type, result)
         return result, chain
 
     if question_type == "数据分析问数类":
-        if df is None:
-            raise ValueError("请先上传包含“问题记录数据”sheet 的 Excel 文件，再进行问数分析。")
-        analysis_result = process_analysis_question(question, df)
+        analysis_df = build_analysis_dataframe(df)
+        if analysis_df is None:
+            raise ValueError("请先上传包含“问题记录数据”sheet 的 Excel 文件，或先提交至少一条工单记录，再进行问数分析。")
+        analysis_result = process_analysis_question(question, analysis_df)
         result = analysis_result["llm_explanation"]
         chain.update(
             {
                 "mode": "analysis",
                 "path": "读取 intent_classification_prompt.txt → LLM 意图识别 → 读取 data_analysis_prompt.txt → LLM 识别分析意图 → Pandas 真实统计 → LLM 生成业务解释与优化建议",
                 "prompt_name": analysis_result["prompt_name"],
-                "analysis_intent": analysis_result["intent"],
-                "raw_analysis_intent": analysis_result["raw_intent"],
+                "analysis_plan": analysis_result["plan"],
+                "raw_analysis_plan": analysis_result["raw_plan"],
                 "stats": analysis_result["stats"],
+                "source_summary": analysis_result["source_summary"],
                 "llm_result": result,
             }
         )
@@ -585,6 +897,109 @@ def process_agent_turn(question: str, df: pd.DataFrame | None) -> tuple[str, dic
         }
     )
     return result, chain
+
+
+def extract_labeled_field(text: str, label: str) -> str:
+    pattern = rf"{re.escape(label)}\s*[：:]\s*(.*?)(?=\n\S[^：:\n]{{0,30}}\s*[：:]|\Z)"
+    match = re.search(pattern, text, flags=re.S)
+    return match.group(1).strip(" \n\r\t-") if match else ""
+
+
+def missing_info_is_empty(value: str) -> bool:
+    cleaned = re.sub(r"\s+", "", value or "")
+    empty_markers = {"", "无", "无缺失", "暂无", "无明显缺失", "不缺失", "已完整", "无。", "暂无。"}
+    return cleaned in empty_markers or "无缺失" in cleaned or "暂无缺失" in cleaned
+
+
+def create_ticket_from_support_response(question: str, question_type: str, llm_output: str) -> dict[str, Any]:
+    missing_info = extract_labeled_field(llm_output, "缺失信息")
+    return {
+        "ticket_id": f"TICKET-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "ticket_type": question_type,
+        "original_question": question,
+        "known_info": extract_labeled_field(llm_output, "已知信息"),
+        "missing_info": missing_info,
+        "handler_role": extract_labeled_field(llm_output, "推荐处理人"),
+        "standard_description": extract_labeled_field(llm_output, "标准化处理建议"),
+        "next_step": extract_labeled_field(llm_output, "下一步建议"),
+        "status": "待确认" if missing_info_is_empty(missing_info) else "待补全",
+    }
+
+
+def extract_json_object(text: str) -> dict[str, Any]:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.S)
+        if not match:
+            raise ValueError("LLM 未返回可解析的工单 JSON。")
+        return json.loads(match.group(0))
+
+
+def update_ticket_with_llm(current_ticket: dict[str, Any], user_input: str) -> dict[str, Any]:
+    system_prompt = (
+        "你是企业数据支持工单补全助手。请根据当前工单草稿和用户补充内容，合并更新工单。"
+        "不要重新分类，不要改变 ticket_id 和 ticket_type。"
+        "只输出 JSON，不要输出 Markdown。"
+    )
+    user_prompt = json.dumps(
+        {
+            "任务": "合并用户补充信息，更新 known_info、missing_info、standard_description、next_step、status。",
+            "状态规则": "如果缺失信息已经基本补齐，将 status 改为“待确认”；仍缺关键资料则为“待补全”。",
+            "输出字段": [
+                "ticket_id",
+                "created_at",
+                "ticket_type",
+                "original_question",
+                "known_info",
+                "missing_info",
+                "handler_role",
+                "standard_description",
+                "next_step",
+                "status",
+            ],
+            "当前工单草稿": current_ticket,
+            "用户补充内容": user_input,
+        },
+        ensure_ascii=False,
+    )
+    raw = call_llm(system_prompt, user_prompt)
+    updated = extract_json_object(raw)
+    merged = {**current_ticket, **updated}
+    if missing_info_is_empty(str(merged.get("missing_info", ""))):
+        merged["status"] = "待确认"
+    elif merged.get("status") not in {"待确认", "已提交"}:
+        merged["status"] = "待补全"
+    return merged
+
+
+def submit_current_ticket() -> str:
+    ticket = st.session_state.get("current_ticket")
+    if not ticket:
+        raise ValueError("当前没有可提交的工单草稿。")
+
+    ticket = {**ticket, "status": "已提交"}
+    fieldnames = [
+        "ticket_id",
+        "created_at",
+        "ticket_type",
+        "original_question",
+        "known_info",
+        "missing_info",
+        "handler_role",
+        "standard_description",
+        "status",
+    ]
+    file_exists = SUBMITTED_TICKETS_PATH.exists()
+    with SUBMITTED_TICKETS_PATH.open("a", encoding="utf-8-sig", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({field: ticket.get(field, "") for field in fieldnames})
+
+    st.session_state.current_ticket = ticket
+    return f"工单已提交，已模拟流转给：{ticket.get('handler_role', '待确认')}"
 
 
 def render_text_result(text: str) -> None:
@@ -605,8 +1020,16 @@ def render_execution_chain(chain: dict[str, Any]) -> None:
     st.write(chain.get("path", ""))
 
     if chain.get("mode") == "analysis":
-        st.markdown("**LLM 解析出的分析意图**")
-        st.write(chain.get("analysis_intent", ""))
+        st.markdown("**数据源说明**")
+        source_summary = chain.get("source_summary", {})
+        if source_summary:
+            st.write(
+                f"上传 Excel 历史记录：{source_summary.get('excel_count', 0)} 条；"
+                f"已提交工单记录：{source_summary.get('submitted_count', 0)} 条；"
+                f"合并后总记录：{source_summary.get('total_count', 0)} 条。"
+            )
+        st.markdown("**LLM 解析出的分析计划 JSON**")
+        st.json(chain.get("analysis_plan", {}))
         st.markdown("**Pandas 统计结果**")
         stats = chain.get("stats")
         if stats:
@@ -807,10 +1230,10 @@ def inject_styles() -> None:
         }
 
         .capability {
-            border: 1px solid var(--line);
+            border: 1px solid rgba(60, 109, 240, 0.22);
             border-radius: 12px;
             padding: 14px 15px;
-            background: rgba(255, 255, 255, 0.72);
+            background: var(--accent-soft);
         }
 
         .capability.active {
@@ -1091,6 +1514,85 @@ def render_debug_details() -> None:
         render_execution_chain(st.session_state.execution_chain)
 
 
+def split_missing_items(missing_info: str) -> list[str]:
+    if missing_info_is_empty(missing_info):
+        return []
+    parts = re.split(r"[；;\n、]+", missing_info)
+    return [part.strip(" -\t\r\n") for part in parts if part.strip(" -\t\r\n")]
+
+
+def render_ticket_field_list(value: str) -> None:
+    if not value:
+        st.write("暂无")
+        return
+    normalized = value.replace("；", "\n").replace(";", "\n")
+    parts = [part.strip(" -\t\r\n") for part in normalized.splitlines() if part.strip(" -\t\r\n")]
+    if len(parts) <= 1:
+        parts = [part.strip(" -\t\r\n") for part in re.split(r"(?<=[。.!?？])", value) if part.strip(" -\t\r\n")]
+    if len(parts) <= 1:
+        st.write(value)
+        return
+    for part in parts:
+        st.markdown(f"- {part}")
+
+
+def render_current_ticket_area() -> None:
+    ticket = st.session_state.get("current_ticket")
+    if not ticket:
+        return
+
+    st.markdown("### 当前工单草稿")
+    st.info(f"工单类型：{ticket.get('ticket_type', '')}｜当前状态：{ticket.get('status', '')}")
+
+    missing_items = split_missing_items(ticket.get("missing_info", ""))
+    if missing_items:
+        st.warning("当前工单信息尚未完整，请补充以下信息")
+        for item in missing_items:
+            st.markdown(f"- {item}")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**已知信息**")
+        render_ticket_field_list(ticket.get("known_info", ""))
+        st.markdown("**推荐处理人**")
+        st.write(ticket.get("handler_role", ""))
+    with col2:
+        st.markdown("**缺失信息**")
+        st.write(ticket.get("missing_info", ""))
+        st.markdown("**下一步建议**")
+        st.write(ticket.get("next_step", ""))
+
+    action_col1, action_col2 = st.columns([1, 1])
+    with action_col1:
+        if st.button("确认提交工单", use_container_width=True):
+            try:
+                message = submit_current_ticket()
+                st.success(message)
+            except ValueError as exc:
+                st.error(str(exc))
+    with action_col2:
+        if st.button("清空当前工单", use_container_width=True):
+            st.session_state.current_ticket = None
+            st.rerun()
+
+
+def render_submitted_tickets_area() -> None:
+    st.markdown("### 已提交工单记录")
+    if not SUBMITTED_TICKETS_PATH.exists():
+        st.caption("暂无已提交工单。")
+        return
+    try:
+        df = pd.read_csv(SUBMITTED_TICKETS_PATH)
+    except Exception as exc:
+        st.warning(f"读取已提交工单失败：{exc}")
+        return
+    if df.empty:
+        st.caption("暂无已提交工单。")
+        return
+    st.caption("当前已提交工单记录可作为后续问数数据来源。")
+    st.dataframe(df.tail(10).iloc[::-1], use_container_width=True)
+
+
 def render_chat_messages() -> None:
     st.markdown('<div class="chat-window">', unsafe_allow_html=True)
     for index, turn in enumerate(st.session_state.get("conversation", []), start=1):
@@ -1171,6 +1673,8 @@ def main() -> None:
         st.session_state.session_updated_at = st.session_state.session_created_at
     if "current_session_file" not in st.session_state:
         st.session_state.current_session_file = None
+    if "current_ticket" not in st.session_state:
+        st.session_state.current_ticket = None
 
     render_sidebar_session_manager()
 
@@ -1263,10 +1767,59 @@ def main() -> None:
                 thinking_slot.empty()
             st.error(str(exc))
 
+    def handle_ticket_update(user_input: str, thinking_slot: Any | None = None) -> None:
+        if not user_input.strip():
+            st.warning("请输入补充信息后再更新工单草稿。")
+            return
+        if not st.session_state.get("current_ticket"):
+            st.warning("当前没有可更新的工单草稿。")
+            return
+        if not OPENAI_API_KEY:
+            st.error(API_KEY_MISSING_MESSAGE)
+            return
+
+        try:
+            if thinking_slot is not None:
+                render_thinking_state(thinking_slot)
+                spinner_context = thinking_slot.container()
+            else:
+                spinner_context = st.container()
+
+            with spinner_context:
+                with st.spinner("正在合并补充信息并更新工单草稿..."):
+                    updated_ticket = update_ticket_with_llm(st.session_state.current_ticket, user_input)
+            if thinking_slot is not None:
+                thinking_slot.empty()
+
+            st.session_state.current_ticket = updated_ticket
+            answer = (
+                f"工单草稿已更新。\n\n"
+                f"当前状态：{updated_ticket.get('status', '')}\n\n"
+                f"缺失信息：{updated_ticket.get('missing_info', '') or '无'}\n\n"
+                f"标准化描述：{updated_ticket.get('standard_description', '')}"
+            )
+            chain = {
+                "question": user_input,
+                "question_type": updated_ticket.get("ticket_type", ""),
+                "mode": "ticket_update",
+                "path": "当前工单草稿 → 用户补充信息 → LLM 合并更新工单草稿",
+                "llm_result": answer,
+            }
+            st.session_state.result_text = answer
+            st.session_state.execution_chain = chain
+            add_conversation_turn(f"补充工单信息：{user_input}", chain, answer)
+            st.session_state.view = "chat"
+            st.rerun()
+        except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            if thinking_slot is not None:
+                thinking_slot.empty()
+            st.error(str(exc))
+
     if st.session_state.view == "chat" and st.session_state.conversation:
         render_chat_header()
         df = render_upload_area(compact=True)
         render_chat_messages()
+        render_current_ticket_area()
         thinking_slot = st.empty()
 
         st.markdown('<div class="chat-input-wrap">', unsafe_allow_html=True)
@@ -1277,12 +1830,19 @@ def main() -> None:
                 height=112,
                 label_visibility="collapsed",
             )
-            submitted = st.form_submit_button("发送")
+            submit_col1, submit_col2 = st.columns([1, 1])
+            with submit_col1:
+                submitted = st.form_submit_button("发送")
+            with submit_col2:
+                update_ticket_submitted = st.form_submit_button("更新工单草稿")
         st.markdown('<div class="footer-note">内容由 AI 生成，仅供参考</div>', unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
         if submitted:
             handle_submit(question, df, thinking_slot)
+        if update_ticket_submitted:
+            handle_ticket_update(question, thinking_slot)
+        render_submitted_tickets_area()
         return
 
     render_minimal_header()
@@ -1301,6 +1861,9 @@ def main() -> None:
 
     render_capabilities()
     df = render_upload_area(compact=False)
+    render_current_ticket_area()
+    render_submitted_tickets_area()
+    render_prompt_expander()
 
     st.markdown('<div class="footer-note">内容由 AI 生成，仅供参考</div>', unsafe_allow_html=True)
 
